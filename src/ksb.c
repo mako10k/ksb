@@ -328,14 +328,19 @@ static void
 ksbloopmount (const char *path_backfile, const char *path_target,
 	      const char *fstype, int flags, const char *data)
 {
-  fdint fd_backfile = ksbopen (path_backfile, O_RDWR);
+  int f = O_LARGEFILE;
+  if (flags & MS_RDONLY)
+    f |= O_RDONLY;
+  else
+    f |= O_RDWR;
+  fdint fd_backfile = ksbopen (path_backfile, f);
   int loopdevno = ksbloopgetfree ();
   size_t sz = snprintf (NULL, 0, "/dev/loop%d", loopdevno);
   char loopdevname[sz + 1];
   snprintf (loopdevname, sizeof (loopdevname), "/dev/loop%d", loopdevno);
   fdint fd_loop = ksbopen (loopdevname, O_RDWR);
   ksbloopset (fd_loop, fd_backfile);
-  int f = LO_FLAGS_AUTOCLEAR;
+  f = LO_FLAGS_AUTOCLEAR;
   if (flags & MS_RDONLY)
     f |= LO_FLAGS_READ_ONLY;
   ksbloopsetstatusflag (fd_loop, f);
