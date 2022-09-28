@@ -18,6 +18,7 @@
 #include <sys/wait.h>
 #include <sys/sendfile.h>
 #include <malloc.h>
+#include <inttypes.h>
 
 #include "config.h"
 
@@ -445,6 +446,86 @@ ksbenvvfree (char **envv)
 }
 #endif
 
+static ssize_t
+ksbsendfile (int ofd, int ifd, off_t * offsetp, size_t count)
+{
+  ssize_t ret = sendfile (ofd, ifd, offsetp, count);
+  if (ret == -1)
+    {
+      if (offsetp)
+	ksblog (LOG_ERR, "sendfile(%d, %d, %p(*(off_t*)%p == %ju), %zu): %s",
+		ofd, ifd, offsetp, offsetp, (intmax_t) * offsetp, count,
+		strerror (errno));
+      else
+	ksblog (LOG_ERR, "sendfile(%d, %d, %p, %zu): %s", ofd, ifd, offsetp,
+		count, strerror (errno));
+      ksbthrow (EXIT_FAILURE);
+    }
+  return ret;
+}
+
+static FILE *
+ksbfopen (const char *pathname, const char *mode)
+{
+  FILE *fp = fopen (pathname, mode);
+  if (fp == NULL)
+    {
+      ksblog (LOG_ERR, "fopen(%s, %s): %s", pathname, mode, strerror (errno));
+      ksbthrow (EXIT_FAILURE);
+    }
+  return fp;
+}
+
+__attribute__((format (scanf, 2, 3)))
+     static int ksbfscanf (FILE * fp, const char *fmt, ...)
+{
+  va_list ap;
+  va_start (ap, fmt);
+  int ret = vfscanf (fp, fmt, ap);
+  if (ret == EOF)
+    {
+      ksblog (LOG_ERR, "fscanf(%p, %s, ...): %s", fp, fmt, strerror (errno));
+      ksbthrow (EXIT_FAILURE);
+    }
+  return ret;
+}
+
+static void
+ksbfclose (FILE * fp)
+{
+  if (fclose (fp) == EOF)
+    {
+      ksblog (LOG_ERR, "close(%p): %s", fp);
+      ksbthrow (EXIT_FAILURE);
+    }
+}
+
+static void
+ksbsethostname (const char *hostname, size_t len)
+{
+  if (sethostname (hostname, len) == -1)
+    {
+      ksblog (LOG_ERR, "sethostname(%s, %zu): %s", hostname, len,
+	      strerror (errno));
+      ksbthrow (EXIT_FAILURE);
+    }
+}
+
+static int
+ksbdprintf (int fd, const char *fmt, ...)
+{
+  va_list ap;
+  va_start (ap, fmt);
+  int ret = vdprintf (fd, fmt, ap);
+  if (ret == -1)
+    {
+      ksblog (LOG_ERR, "vdprintf(%d, %s, ...): %s", fd, fmt,
+	      strerror (errno));
+      ksbthrow (EXIT_FAILURE);
+    }
+  return ret;
+}
+
 #ifndef DATADIR
 #define DATADIR "/usr/local/share"
 #endif
@@ -458,8 +539,9 @@ main (int argc, char *argv[])
   const char *rwimage = NULL;
   const char *rwfstype = "ext4";
   const char *rwopt = NULL;
+  const char *host = NULL;
   int opt;
-  while ((opt = getopt (argc, argv, "f:t:o:F:T:O:vh")) != -1)
+  while ((opt = getopt (argc, argv, "f:t:o:F:T:O:H:vh")) != -1)
     {
       switch (opt)
 	{
@@ -480,6 +562,9 @@ main (int argc, char *argv[])
 	  break;
 	case 'O':
 	  rwopt = optarg;
+	  break;
+	case 'H':
+	  host = optarg;
 	  break;
 	case 'v':
 	  fprintf (stdout, "%s\n", PACKAGE_STRING);
@@ -503,6 +588,8 @@ main (int argc, char *argv[])
 		   rwfstype);
 	  fprintf (stdout, "  -O options : rw    mount options   [%s]\n",
 		   rwopt);
+	  fprintf (stdout, "  -H host    : hostname              [%s]\n",
+		   host ? : "autodetect");
 	  fprintf (stdout, "\n");
 	  fprintf (stdout, "  -v         : print version and exit\n");
 	  fprintf (stdout, "  -h         : print usage   and exit\n");
@@ -542,31 +629,51 @@ main (int argc, char *argv[])
 	    ksbmount ("overlay", "/mnt/root", "overlay", 0,
 		      "lowerdir=/mnt/lower,upperdir=/mnt/rw/upper,workdir=/mnt/rw/work");
 	    fdint wfd = ksbopen ("/mnt/root/etc/resolv.conf", O_WRONLY);
-	    if (sendfile (wfd, rfd, NULL, 0xffffffff) == -1)
-	      {
-		ksblog (LOG_ERR, "sendfile(%d, %d, NULL, 0xffffffff): %s",
-			wfd, rfd, strerror (errno));
-		ksbthrow (EXIT_FAILURE);
-	      }
-	    ksbmount ("proc", "/mnt/root/proc", "proc",
-		      MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME, NULL);
-	    ksbmount ("/sys", "/mnt/root/sys", NULL, MS_BIND, NULL);
-	    ksbmount ("/dev", "/mnt/root/dev", NULL, MS_BIND, NULL);
-	    ksbmount ("/dev/pts", "/mnt/root/dev/pts", NULL, MS_BIND, NULL);
-	    ksbmkdir_nc ("/mnt/root/run", 0755);
-	    ksbmount ("none", "/mnt/root/run", "tmpfs", MS_NOSUID | MS_NODEV,
-		      "mode=755");
-	    ksbmkdir_nc ("/mnt/root/run/lock", 0755);
-	    ksbmkdir_nc ("/mnt/root/run/shm", 0755);
-	    ksbmkdir_nc ("/mnt/root/run/user", 0755);
-	    ksbmount ("none", "/mnt/root/run/lock", "tmpfs",
-		      MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME, NULL);
-	    ksbmount ("none", "/mnt/root/run/shm", "tmpfs",
-		      MS_NOSUID | MS_NODEV | MS_NOATIME, NULL);
-	    ksbmount ("none", "/mnt/root/run/user", "tmpfs",
-		      MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME,
-		      "mode=755");
+	    while (ksbsendfile (wfd, rfd, NULL, 0x7fffffff));
 	  }
+	  static char hostname[25];
+	  if (!host)
+	    {
+	      FILE *fp = ksbfopen ("/mnt/root/etc/hostname", "r");
+	      int ret = ksbfscanf (fp, "%24s", hostname);
+	      if (ret != 1)
+		{
+		  ksblog (LOG_ERR, "fscanf(%p, %%24s, %p) returns %d: %s", fp,
+			  hostname, ret, strerror (errno));
+		  ksbfclose (fp);
+		  ksbthrow (EXIT_FAILURE);
+		}
+	      ksbfclose (fp);
+	      host = hostname;
+	    }
+	  ksbsethostname (host, strlen (host));
+
+	  {
+	    fdint fd_hosts_in = ksbopen ("/mnt/root/etc/hosts", O_RDONLY);
+	    fdint fd_hosts_out =
+	      ksbopen ("/mnt/hosts", O_WRONLY | O_CREAT | O_EXCL);
+	    while (ksbsendfile (fd_hosts_out, fd_hosts_in, NULL, 0x7fffffff));
+	    ksbdprintf (fd_hosts_out, "\n127.0.0.1\t%s\n", host);
+	  }
+	  ksbmount ("/mnt/hosts", "/mnt/root/etc/hosts", NULL, MS_BIND, NULL);
+	  ksbmount ("proc", "/mnt/root/proc", "proc",
+		    MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME, NULL);
+	  ksbmount ("/sys", "/mnt/root/sys", NULL, MS_BIND, NULL);
+	  ksbmount ("/dev", "/mnt/root/dev", NULL, MS_BIND, NULL);
+	  ksbmount ("/dev/pts", "/mnt/root/dev/pts", NULL, MS_BIND, NULL);
+	  ksbmkdir_nc ("/mnt/root/run", 0755);
+	  ksbmount ("none", "/mnt/root/run", "tmpfs", MS_NOSUID | MS_NODEV,
+		    "mode=755");
+	  ksbmkdir_nc ("/mnt/root/run/lock", 0755);
+	  ksbmkdir_nc ("/mnt/root/run/shm", 0755);
+	  ksbmkdir_nc ("/mnt/root/run/user", 0755);
+	  ksbmount ("none", "/mnt/root/run/lock", "tmpfs",
+		    MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME, NULL);
+	  ksbmount ("none", "/mnt/root/run/shm", "tmpfs",
+		    MS_NOSUID | MS_NODEV | MS_NOATIME, NULL);
+	  ksbmount ("none", "/mnt/root/run/user", "tmpfs",
+		    MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME,
+		    "mode=755");
 	  ksbchdir ("/mnt/root/root");
 	  ksbchroot ("/mnt/root");
 	  ksbchdir ("/root");
