@@ -530,6 +530,50 @@ ksbdprintf (int fd, const char *fmt, ...)
 #define DATADIR "/usr/local/share"
 #endif
 
+static void
+ksbsethostname2(const char *hostname_new) {
+  struct stat st;
+  char hostname_old[HOST_NAME_MAX + 1];
+  fdint fd_hostname_old = open("/mnt/rw/hostname.old", O_RDWR);
+  if (fd_hostname_old == -1) {
+	 if (errno != ENOENT) {
+	  ksblog(LOG_ERR, "open(/mnt/rw/hostname.old, O_RDWR): %s", strerror(errno));
+	  ksbthrow(EXIT_FAILURE);
+	 }
+	 if (gethostname(hostname_old, HOST_NAME_MAX) == -1) {
+		 ksblog(LOG_ERR, "gethostname(%p, %d): %s", hostname_old, HOST_NAME_MAX, strerror(hostname_old));
+		 ksbthrow(EXIT_FAILURE);
+	 }
+	 fd_hostname_old = open("/mnt/rw/hostname.old", O_RDWR | O_CREAT | O_EXCL);
+	 if (fd_hostname_old == -1) {
+	  ksblog(LOG_ERR, "open(/mnt/rw/hostname.old, O_RDWR|O_CREAT|O_EXCL): %s", strerror(errno));
+	  ksbthrow(EXIT_FAILURE);
+	 }
+	 if (write(fd_hostname_old, hostname_old, strlen(hostname_old)) == -1) {
+		 ksblog(LOG_ERR, "write(%d, %s, %zu): %s", fd_hostname_old, hostname_old, strlen(hostname_old), strerror(errno));
+		 ksbthrow(EXIT_FAILURE);
+	 }
+	 if (seek(fd_hostname_old, 0, SEEK_SET) == -1) {
+		 ksblog(LOG_ERR, "seek(%d, 0, SEEK_SET): %s", fd_hostname_old, strerror(errno));
+		 ksbthrow(EXIT_FAILURE);
+	 }
+  }
+	 ssize_t hostname_old_size = read(fd_hostname_old, hostname_old, HOST_NAME_MAX);
+	 if (sz == -1) {
+		 ksblog(LOG_ERR, "read(%d, %p, %zu): %s", fd_hostname_old, hostname_old, sizeof(hostname_old), strerror(errno));
+		 ksbthrow(EXIT_FAILURE);
+	 }
+	 hostname_old[HOST_NAME_MAX] = '\0';
+	 char *s = strnchrnul(hostname_old, '\n');
+	 *s = '\0';
+  
+
+
+
+
+}
+
+
 int
 main (int argc, char *argv[])
 {
