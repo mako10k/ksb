@@ -1,0 +1,5 @@
+If:
+    PathMatch: .*\.[ch]
+
+CompileFlags:
+    Add: ["-Wall", "-Werror"]

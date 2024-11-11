@@ -6,6 +6,8 @@ AC_INIT([ksb], [0.0.1], [mako10k@mk10.org])
 AC_CONFIG_SRCDIR([src/ksb.c])
 AC_CONFIG_HEADERS([config.h])
 
+AC_USE_SYSTEM_EXTENSIONS
+
 AM_INIT_AUTOMAKE([foreign])
 LT_INIT
 
