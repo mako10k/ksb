@@ -1,6 +1,7 @@
-
 #ifdef HAVE_CONFIG_H
 #include "config.h"
+#else
+#define PACKAGE_STRING "ksb 0.1"
 #endif
 
 #include <errno.h>
@@ -181,42 +182,43 @@ static void ksbmount(const char *source, const char *target, const char *fstype,
   }
 }
 
-static void ksbmkdir(const char *pathname, mode_t mode) {
-  if (mkdir(pathname, mode) == -1) {
+static void ksbmkdirat(int dirfd, const char *pathname, mode_t mode) {
+  if (mkdirat(dirfd, pathname, mode) == -1) {
     ksblog(LOG_ERR, "mkdir(%s, 0%o): %s", pathname, mode, strerror(errno));
     ksbthrow(EXIT_FAILURE);
   }
 }
 
-static void ksbmkdir_nc(const char *pathname, mode_t mode) {
-  if (mkdir(pathname, mode) == -1 && errno != EEXIST) {
+static void ksbmkdirat_nc(int dirfd, const char *pathname, mode_t mode) {
+  if (mkdirat(dirfd, pathname, mode) == -1 && errno != EEXIST) {
     ksblog(LOG_ERR, "mkdir(%s, 0%o): %s", pathname, mode, strerror(errno));
     ksbthrow(EXIT_FAILURE);
   }
 }
 
-static int ksbopen(const char *pathname, int flags, ...) {
+static int ksbopenat(int dirfd, const char *pathname, int flags, ...) {
   int fd;
   if (flags & O_CREAT || flags & O_TMPFILE) {
     va_list ap;
     va_start(ap, flags);
     int mode = va_arg(ap, int);
     va_end(ap);
-    fd = open(pathname, flags, mode);
+    fd = openat(dirfd, pathname, flags, mode);
     if (fd == -1) {
       int err = errno;
       char *f = ksbflags(open_flags, flags);
-      ksblog(LOG_ERR, "open(%s, %s, 0%o): %s", pathname, f, mode,
+      ksblog(LOG_ERR, "openat(%d, %s, %s, 0%o): %s", dirfd, pathname, f, mode,
              strerror(err));
       free(f);
       ksbthrow(EXIT_FAILURE);
     }
   } else {
-    fd = open(pathname, flags);
+    fd = openat(dirfd, pathname, flags);
     if (fd == -1) {
       int err = errno;
       char *f = ksbflags(open_flags, flags);
-      ksblog(LOG_ERR, "open(%s, %s): %s", pathname, f, strerror(err));
+      ksblog(LOG_ERR, "openat(%d, %s, %s): %s", dirfd, pathname, f,
+             strerror(err));
       free(f);
       ksbthrow(EXIT_FAILURE);
     }
@@ -231,8 +233,8 @@ static void ksbclose(int fd) {
   }
 }
 
-static int ksbloopgetfree(void) {
-  int fd = ksbopen("/dev/loop-control", O_RDWR);
+static int ksbloopgetfree(int dirfd) {
+  int fd = ksbopenat(dirfd, "dev/loop-control", O_RDWR);
   int loopdevno = ioctl(fd, LOOP_CTL_GET_FREE);
   if (loopdevno == -1) {
     ksblog(LOG_ERR, "ioctl(%d, LOOP_CTL_GET_FREE): %s", fd, strerror(errno));
@@ -274,32 +276,33 @@ static void ksbcleanupfd(int *fdp) {
     ksbclose(*fdp);
 }
 
-#define fdint __attribute__((cleanup(ksbcleanupfd))) int
+#define fdint_t int __attribute__((cleanup(ksbcleanupfd)))
 
-static void ksbloopmount(const char *path_backfile, const char *path_target,
-                         const char *fstype, int flags, const char *data) {
-  int f = O_LARGEFILE;
+static void ksbloopmount(int rootfd_old, const char *path_backfile,
+                         const char *path_target, const char *fstype, int flags,
+                         const char *data) {
+  int flags_backfile = O_LARGEFILE;
   if (flags & MS_RDONLY)
-    f |= O_RDONLY;
+    flags_backfile |= O_RDONLY;
   else
-    f |= O_RDWR;
-  fdint fd_backfile = ksbopen(path_backfile, f);
-  int loopdevno = ksbloopgetfree();
-  size_t sz = snprintf(NULL, 0, "/dev/loop%d", loopdevno);
+    flags_backfile |= O_RDWR;
+  fdint_t fd_backfile = ksbopenat(AT_FDCWD, path_backfile, flags_backfile);
+  int loopdevno = ksbloopgetfree(rootfd_old);
+  size_t sz = snprintf(NULL, 0, "dev/loop%d", loopdevno);
   char loopdevname[sz + 1];
-  snprintf(loopdevname, sizeof(loopdevname), "/dev/loop%d", loopdevno);
-  fdint fd_loop = ksbopen(loopdevname, O_RDWR);
+  snprintf(loopdevname, sizeof(loopdevname), "dev/loop%d", loopdevno);
+  fdint_t fd_loop = ksbopenat(rootfd_old, loopdevname, O_RDWR);
   ksbloopset(fd_loop, fd_backfile);
-  f = LO_FLAGS_AUTOCLEAR;
+  int flags_loop = LO_FLAGS_AUTOCLEAR;
   if (flags & MS_RDONLY)
-    f |= LO_FLAGS_READ_ONLY;
-  ksbloopsetstatusflag(fd_loop, f);
+    flags_loop |= LO_FLAGS_READ_ONLY;
+  ksbloopsetstatusflag(fd_loop, flags_loop);
   ksbmount(loopdevname, path_target, fstype, flags, data);
 }
 
-static void ksbchdir(const char *dir) {
-  if (chdir(dir) == -1) {
-    ksblog(LOG_ERR, "chdir(%s): %s", dir, strerror(errno));
+static void ksbchdir(const char *dirname) {
+  if (chdir(dirname) == -1) {
+    ksblog(LOG_ERR, "chdir(%s): %s", dirname, strerror(errno));
     ksbthrow(EXIT_FAILURE);
   }
 }
@@ -386,34 +389,6 @@ static ssize_t ksbsendfile(int ofd, int ifd, off_t *offsetp, size_t count) {
   return ret;
 }
 
-static FILE *ksbfopen(const char *pathname, const char *mode) {
-  FILE *fp = fopen(pathname, mode);
-  if (fp == NULL) {
-    ksblog(LOG_ERR, "fopen(%s, %s): %s", pathname, mode, strerror(errno));
-    ksbthrow(EXIT_FAILURE);
-  }
-  return fp;
-}
-
-__attribute__((format(scanf, 2, 3))) static int
-ksbfscanf(FILE *fp, const char *fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  int ret = vfscanf(fp, fmt, ap);
-  if (ret == EOF) {
-    ksblog(LOG_ERR, "fscanf(%p, %s, ...): %s", fp, fmt, strerror(errno));
-    ksbthrow(EXIT_FAILURE);
-  }
-  return ret;
-}
-
-static void ksbfclose(FILE *fp) {
-  if (fclose(fp) == EOF) {
-    ksblog(LOG_ERR, "close(%p): %s", fp, strerror(errno));
-    ksbthrow(EXIT_FAILURE);
-  }
-}
-
 static void ksbsethostname(const char *hostname, size_t len) {
   if (sethostname(hostname, len) == -1) {
     ksblog(LOG_ERR, "sethostname(%s, %zu): %s", hostname, len, strerror(errno));
@@ -436,48 +411,26 @@ static int ksbdprintf(int fd, const char *fmt, ...) {
 #define DATADIR "/usr/local/share"
 #endif
 
-static void ksbsethostname2(const char *hostname_new) {
-  char hostname_old[HOST_NAME_MAX + 1];
-  fdint fd_hostname_old = open("/mnt/rw/hostname.old", O_RDWR);
-  if (fd_hostname_old == -1) {
-    if (errno != ENOENT) {
-      ksblog(LOG_ERR, "open(/mnt/rw/hostname.old, O_RDWR): %s",
-             strerror(errno));
-      ksbthrow(EXIT_FAILURE);
-    }
-    if (gethostname(hostname_old, HOST_NAME_MAX) == -1) {
-      ksblog(LOG_ERR, "gethostname(%p, %d): %s", hostname_old, HOST_NAME_MAX,
-             strerror(errno));
-      ksbthrow(EXIT_FAILURE);
-    }
-    fd_hostname_old = open("/mnt/rw/hostname.old", O_RDWR | O_CREAT | O_EXCL);
-    if (fd_hostname_old == -1) {
-      ksblog(LOG_ERR, "open(/mnt/rw/hostname.old, O_RDWR|O_CREAT|O_EXCL): %s",
-             strerror(errno));
-      ksbthrow(EXIT_FAILURE);
-    }
-    if (write(fd_hostname_old, hostname_old, strlen(hostname_old)) == -1) {
-      ksblog(LOG_ERR, "write(%d, %s, %zu): %s", fd_hostname_old, hostname_old,
-             strlen(hostname_old), strerror(errno));
-      ksbthrow(EXIT_FAILURE);
-    }
-    if (lseek(fd_hostname_old, 0, SEEK_SET) == -1) {
-      ksblog(LOG_ERR, "seek(%d, 0, SEEK_SET): %s", fd_hostname_old,
-             strerror(errno));
-      ksbthrow(EXIT_FAILURE);
-    }
-  }
-  ssize_t hostname_old_size =
-      read(fd_hostname_old, hostname_old, HOST_NAME_MAX);
-  if (hostname_old_size == -1) {
-    ksblog(LOG_ERR, "read(%d, %p, %zu): %s", fd_hostname_old, hostname_old,
-           sizeof(hostname_old), strerror(errno));
+static int ksbopen_tree(int dfd, const char *pathname, int flags) {
+  int fd = open_tree(dfd, pathname, flags);
+  if (fd == -1) {
+    ksblog(LOG_ERR, "open_tree(%d, %s, %s): %s", dfd, pathname,
+           ksbflags(open_flags, flags), strerror(errno));
     ksbthrow(EXIT_FAILURE);
   }
-  hostname_old[HOST_NAME_MAX] = '\0';
-  char *s = strchr(hostname_old, '\n');
-  if (s)
-    *s = '\0';
+  return fd;
+}
+
+static int ksbmove_mount(int from_dfd, const char *from_pathname, int to_dfd,
+                         const char *to_pathname, unsigned int flags) {
+  int ret = move_mount(from_dfd, from_pathname, to_dfd, to_pathname, flags);
+  if (ret == -1) {
+    ksblog(LOG_ERR, "move_mount(%d, %s, %d, %s, %s): %s", from_dfd,
+           from_pathname, to_dfd, to_pathname, ksbflags(mount_flags, flags),
+           strerror(errno));
+    ksbthrow(EXIT_FAILURE);
+  }
+  return ret;
 }
 
 int main(int argc, char *argv[]) {
@@ -545,56 +498,54 @@ int main(int argc, char *argv[]) {
   argc -= optind;
   argv += optind;
   ksbtry(int ret) {
+    fdint_t rootfd_old = ksbopenat(AT_FDCWD, "/", O_PATH);
     ksbunshare(CLONE_NEWIPC | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS);
     pid_t pid = fork();
     if (pid == 0) {
       ksbtry(int ret) {
         ksbsetuid(0);
         ksbsetgid(0);
-        {
-          fdint rfd = ksbopen("/etc/resolv.conf", O_RDONLY);
-          ksbmount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL);
-          ksbmount("tmpfs", "/mnt", "tmpfs", 0, NULL);
-          ksbmkdir("/mnt/lower", 0755);
-          ksbmkdir("/mnt/root", 0755);
-          ksbmkdir("/mnt/rw", 0755);
-          ksbloopmount(lowerimage, "/mnt/lower", lowerfstype, MS_RDONLY,
-                       loweropt);
-          if (rwimage)
-            ksbloopmount(rwimage, "/mnt/rw", rwfstype, 0, rwopt);
-          ksbmkdir_nc("/mnt/rw/upper", 0755);
-          ksbmkdir_nc("/mnt/rw/work", 0755);
-          ksbmount("overlay", "/mnt/root", "overlay", 0,
-                   "lowerdir=/mnt/lower,upperdir=/mnt/rw/upper,workdir=/mnt/rw/"
-                   "work");
-          fdint wfd = ksbopen("/mnt/root/etc/resolv.conf", O_WRONLY);
-          while (ksbsendfile(wfd, rfd, NULL, 0x7fffffff))
-            ;
-        }
+        ksbmount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL);
+        ksbmount("tmpfs", "/mnt", "tmpfs", 0, NULL);
+        fdint_t rootfd_tmp = ksbopenat(rootfd_old, "mnt", O_PATH);
+        ksbmkdirat(rootfd_tmp, "lower", 0755);
+        ksbmkdirat(rootfd_tmp, "root", 0755);
+        ksbmkdirat(rootfd_tmp, "rw", 0755);
+        ksbloopmount(rootfd_tmp, lowerimage, "lower", lowerfstype, MS_RDONLY,
+                     loweropt);
+        if (rwimage)
+          ksbloopmount(rootfd_tmp, rwimage, "rw", rwfstype, 0, rwopt);
+        ksbmkdirat_nc(rootfd_tmp, "rw/upper", 0755);
+        ksbmkdirat_nc(rootfd_tmp, "rw/work", 0755);
+        ksbmount("overlay", "/mnt/root", "overlay", 0,
+                 "lowerdir=/mnt/lower,upperdir=/mnt/rw/upper,workdir=/mnt/rw/"
+                 "work");
+        fdint_t rootfd_new = ksbopenat(rootfd_tmp, "root", O_PATH);
+        ksbmount("/etc/resolv.conf", "/etc/resolv.conf", NULL, MS_BIND, NULL);
         static char hostname[25];
         if (!host) {
-          FILE *fp = ksbfopen("/mnt/root/etc/hostname", "r");
-          int ret = ksbfscanf(fp, "%24s", hostname);
+          fdint_t fd_hostname =
+              ksbopenat(rootfd_new, "etc/hostname", O_RDONLY);
+          ssize_t ret = read(fd_hostname, hostname, sizeof(hostname) - 1);
           if (ret != 1) {
-            ksblog(LOG_ERR, "fscanf(%p, %%24s, %p) returns %d: %s", fp,
-                   hostname, ret, strerror(errno));
-            ksbfclose(fp);
+            ksblog(LOG_ERR, "read(%d, %p, %zu): %s", fd_hostname, hostname,
+                   sizeof(hostname) - 1, strerror(errno));
             ksbthrow(EXIT_FAILURE);
           }
-          ksbfclose(fp);
+          hostname[ret] = '\0';
           host = hostname;
         }
         ksbsethostname(host, strlen(host));
 
         {
-          fdint fd_hosts_in = ksbopen("/mnt/root/etc/hosts", O_RDONLY);
-          fdint fd_hosts_out =
-              ksbopen("/mnt/hosts", O_WRONLY | O_CREAT | O_EXCL);
+          fdint_t fd_hosts_in = ksbopenat(rootfd_new, "etc/hosts", O_RDONLY);
+          fdint_t fd_hosts_out =
+              ksbopenat(rootfd_tmp, "/hosts", O_WRONLY | O_CREAT | O_EXCL);
           while (ksbsendfile(fd_hosts_out, fd_hosts_in, NULL, 0x7fffffff))
             ;
           ksbdprintf(fd_hosts_out, "\n127.0.1.1\t%s\n", host);
         }
-        ksbmount("/mnt/hosts", "/mnt/root/etc/hosts", NULL, MS_BIND, NULL);
+        ksbmove_mount(rootfd_tmp, "/hosts", rootfd_new, "/etc/hosts", MS_BIND);
         ksbmount("proc", "/mnt/root/proc", "proc",
                  MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME, NULL);
         ksbmount("/sys", "/mnt/root/sys", NULL, MS_BIND, NULL);
@@ -640,6 +591,10 @@ int main(int argc, char *argv[]) {
       ksbcatch_all { exit(ret); }
       ksbend;
     }
+
+    ksbclose(rootfd_old);
+    rootfd_old = -1;
+
     int status = 0;
     while (1) {
       if (waitpid(pid, &status, 0) == -1) {
